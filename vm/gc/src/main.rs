@@ -1,4 +1,6 @@
 use std::ptr::{NonNull, write};
+use super::alloc_api::{SizeClass, AllocRaw, AllocHeader, AllocObject, AllocTypeId};
+use core::cell::UnsafeCell;
 use rand::Rng;
 
 pub type BlockPtr = NonNull<u8>;
@@ -9,6 +11,7 @@ pub const LINE_SIZE_BITS: usize = 7;
 pub const LINE_SIZE: usize = 1 << LINE_SIZE_BITS;
 pub const LINE_COUNT: usize = BLOCK_SIZE / LINE_SIZE;
 pub const BLOCK_CAPACITY: usize = BLOCK_SIZE - LINE_COUNT;
+
 
 pub struct Block {
     pub ptr: BlockPtr,
@@ -21,13 +24,155 @@ pub struct BlockMeta {
 
 // interface for bump allocation
 pub struct BumpBlock {
-    pub cursor: *const u8, //next address for allocating a new block
-    pub limit: *const u8,
-    pub block: Block, // block to allocate
-    pub lines: *mut u8 //address to marked line
+    pub cursor: *const u8, // ending index of line in the block where the last object was written
+    pub limit: *const u8, // starting index of line in the block where the last object was written
+    pub block: Block, // information about current block
+    pub lines: *mut u8 //address to line containing marked information (i.e. lines that contain allocated objects)
+}
+
+pub struct BlockList {
+    head: Option<BumpBlock>,
+    overflow: Option<BumpBlock>,
+    list: Vec<BumpBlock>,
+}
+
+pub struct StickyImmixHeap<H> {
+    blocks: UnsafeCell<BlockList>,
+    _header_type: PhantomData<*const H>
+}
+
+impl StickyImmixHeap<H> {
+    fn find_space(
+        &self,
+        alloc_size: usize,
+        size_class: SizeClass,
+    ) -> Result<*const u8, AllocError> {
+        let blocks = unsafe { &mut *self.blocks.get() };
+        match blocks.head {
+            Some(ref mut head) => {
+                if size_class = SizeClass::Medium && alloc_size > head.current_hole_size() {
+                    return blocks.overflow_alloc(alloc_size)
+                }
+            }
+            None => {
+                blocks.head = Some(blocks.overflow_alloc(alloc_size));
+            }
+        }
+    }
+}
+
+impl <H: AllocHeader> AllocRaw<H> for StickyImmixHeap<H> {
+    fn alloc<T>(&self, object: T) -> Result<RawPtr<T>, AllocError>
+    where
+        T: AllocObject<<Self::Header as AllocHseader>::TypeId>,
+    {
+        // calculate the total size of the object and it's header
+        let header_size = size_of::<Self::Header>();
+        let object_size = size_of::<T>();
+        let total_size = header_size + object_size;
+
+        // round the size to the next word boundary to keep objects aligned and get the size class
+        // TODO BUG? should this be done separately for header and object?
+        //  If the base allocation address is where the header gets placed, perhaps
+        //  this breaks the double-word alignment object alignment desire?
+        let alloc_size = alloc_size_of(total_size);
+        let size_class = SizeClass::get_for_size(alloc_size)?;
+
+        // attempt to allocate enough space for the header and the object
+        let space = self.find_space(alloc_size, size_class)?;
+
+        // instantiate an object header for type T, setting the mark bit to "allocated"
+        let header = Self::Header::new::<T>(object_size as ArraySize, size_class, Mark::Allocated);
+
+        // write the header into the front of the allocated space
+        unsafe {
+            write(space as *mut Self::Header, header);
+        }
+
+        // write the object into the allocated space after the header
+        let object_space = unsafe { space.offset(header_size as isize) };
+        unsafe {
+            write(object_space as *mut T, object);
+        }
+
+        // return a pointer to the object in the allocated space
+        Ok(RawPtr::new(object_space as *const T))
+    }
+
+    fn alloc_array(&self, size_bytes: ArraySize) -> Result<RawPtr<u8>, AllocError> {
+        // calculate the total size of the array and it's header
+        let header_size = size_of::<Self::Header>();
+        let total_size = header_size + size_bytes as usize;
+
+        // round the size to the next word boundary to keep objects aligned and get the size class
+        let alloc_size = alloc_size_of(total_size);
+        let size_class = SizeClass::get_for_size(alloc_size)?;
+
+        // attempt to allocate enough space for the header and the array
+        let space = self.find_space(alloc_size, size_class)?;
+
+        // instantiate an object header for an array, setting the mark bit to "allocated"
+        let header = Self::Header::new_array(size_bytes, size_class, Mark::Allocated);
+
+        // write the header into the front of the allocated space
+        unsafe {
+            write(space as *mut Self::Header, header);
+        }
+
+        // calculate where the array will begin after the header
+        let array_space = unsafe { space.offset(header_size as isize) };
+
+        // Initialize object_space to zero here.
+        // If using the system allocator for any objects (SizeClass::Large, for example),
+        // the memory may already be zeroed.
+        let array = unsafe { from_raw_parts_mut(array_space as *mut u8, size_bytes as usize) };
+        // The compiler should recognize this as optimizable
+        for byte in array {
+            *byte = 0;
+        }
+
+        // return a pointer to the array in the allocated space
+        Ok(RawPtr::new(array_space as *const u8))
+    }
+
+    fn get_header(object: NonNull<()>) -> NonNull<Self::Header> {
+        unsafe { NonNull::new_unchecked(object.cast::<Self::Header>().as_ptr().offset(-1)) }
+    }
+    fn get_object(header: NonNull<Self::Header>) -> NonNull<()> {
+        unsafe { NonNull::new_unchecked(header.as_ptr().offset(1).cast::<()>()) }
+    }
+}
+
+impl BlockList {
+    fn overflow_alloc(&mut self, alloc_size: usize) -> Result<*const u8, AllocError> {
+        match self.overflow {
+            Some(ref mut overflow) => {
+                match overflow.inner_alloc(alloc_size) {
+                    Some(space) => space,
+                    None => {
+                        let previous = replace(overflow, BumpBlock::new()?);
+                        self.rest.push(previous);
+                        overflow.inner_alloc(alloc_size).expect("Not enough space to allocate memory!"); //recursively allocates blocks
+                    }
+                }
+            }
+            None => {
+                let mut overflow = BumpBlock::new()?;
+                let allocated_mem = overflow.inner_alloc(alloc_size).expect("Not enough space to allocate memory!"); //recursively allocates blocks
+                self.overflow = Some(overflow);
+                allocated_mem //address for 
+            }
+        }
+    }
 }
 
 impl BumpBlock {
+
+    pub fn new() -> BumpBlock{
+        BumpBlock {
+
+        }
+    }
 
     pub fn inner_alloc(&mut self, alloc_size: usize) -> Option<*const u8> {
         let ptr = self.cursor as usize;
@@ -46,7 +191,7 @@ impl BumpBlock {
                 {
                     self.cursor = unsafe { self.block.as_ptr().add(cursor) };
                     self.limit = unsafe { self.block.as_ptr().add(limit) };
-                    return self.inner_alloc(alloc_size);
+                    return self.inner_alloc(alloc_size); //recursive call
                 }
             }
 
@@ -147,7 +292,5 @@ impl Block {
 
 
 fn main() {
-    let addr = rand::thread_rng().gen();
-    let block = BumpBlock { cursor: addr as *const u8, limit: , block: Block::new(128), meta: }
-    let allocated_addr = block.inner_alloc(128).unwrap();
+
 }
