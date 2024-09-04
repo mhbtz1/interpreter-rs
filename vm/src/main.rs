@@ -1,5 +1,5 @@
 use std::io::Write;
-
+use gc::AllocRaw;
 fn main() {
     let alignment = size_of::<usize>() * 2;
     let usize_alignment = std::mem::align_of::<usize>();
